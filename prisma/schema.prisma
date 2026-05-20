@@ -1,0 +1,223 @@
+// Hosted T4T Gateway — Prisma schema.
+//
+// One operator wallet handles all on-chain transactions. Tenants are off-chain
+// ledger entries denominated in xBZZ wei (Decimal(78, 0) holds any uint256).
+// USD is never in the billing path — only in `Topup` rows for Phase 2 Stripe.
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+// Connection URL + seed config live in prisma.config.ts (Prisma 7).
+datasource db {
+  provider = "postgresql"
+}
+
+// -----------------------------------------------------------------------------
+// Enums
+// -----------------------------------------------------------------------------
+
+enum UserRole {
+  USER
+  ADMIN
+}
+
+enum AuthProvider {
+  google
+  email
+}
+
+enum AccountStatus {
+  active
+  disabled
+}
+
+enum LedgerKind {
+  welcomeGrant
+  settle
+  refund
+  topup
+  adjustment
+}
+
+enum GatewayJobStatus {
+  posted
+  acked
+  delivered
+  claimed
+  cancelled
+  timed_out
+  failed
+}
+
+enum TopupStatus {
+  requires_payment
+  processing
+  succeeded
+  credited
+  failed
+  refunded
+}
+
+// -----------------------------------------------------------------------------
+// User + auth
+// -----------------------------------------------------------------------------
+
+model User {
+  id                String        @id @default(uuid())
+  createdAt         DateTime      @default(now())
+  updatedAt         DateTime      @updatedAt
+  email             String        @unique
+  emailVerified     Boolean       @default(false)
+  // Single-use email verification token (NULL once consumed). For Phase 1 we
+  // surface this in the signup response in dev/test mode; Phase 1.5 wires up
+  // a real outbound mailer and stops echoing the token back.
+  verificationToken String?       @unique
+  authProvider      AuthProvider
+  googleSub         String?       @unique
+  passwordHash      String?
+  role              UserRole      @default(USER)
+
+  // Phase 2 — Stripe handles billing address + sanctions screening
+  stripeCustomerId String?    @unique
+  country          String?    // ISO 3166-1 alpha-2, mirrored from Stripe
+
+  account       Account?
+  apiKeys       ApiKey[]
+  gatewayJobs   GatewayJob[]
+  topups        Topup[]
+
+  @@index([authProvider, googleSub])
+}
+
+model ApiKey {
+  id                 String   @id @default(uuid())
+  createdAt          DateTime @default(now())
+  key                String   @unique @default(uuid())
+  name               String   @default("")
+  lastUsedAt         DateTime?
+  scopeMaxXbzzPerDay Decimal? @db.Decimal(78, 0)
+  modelAllowlist     String[] @default([])
+
+  user   User   @relation(fields: [userId], references: [id], onDelete: Cascade)
+  userId String
+
+  @@index([userId])
+}
+
+// -----------------------------------------------------------------------------
+// Account + ledger
+// -----------------------------------------------------------------------------
+
+model Account {
+  id              String         @id @default(uuid())
+  createdAt       DateTime       @default(now())
+  updatedAt       DateTime       @updatedAt
+  status          AccountStatus  @default(active)
+  balanceXbzzWei  Decimal        @default(0) @db.Decimal(78, 0)
+  reservedXbzzWei Decimal        @default(0) @db.Decimal(78, 0)
+
+  user   User   @relation(fields: [userId], references: [id], onDelete: Cascade)
+  userId String @unique
+
+  ledgerEntries LedgerEntry[]
+}
+
+model LedgerEntry {
+  id              String     @id @default(uuid())
+  createdAt       DateTime   @default(now())
+  kind            LedgerKind
+  deltaXbzzWei    Decimal    @db.Decimal(78, 0)
+  idempotencyKey  String     @unique
+  note            String?
+
+  account     Account     @relation(fields: [accountId], references: [id], onDelete: Cascade)
+  accountId   String
+
+  gatewayJob  GatewayJob? @relation(fields: [gatewayJobId], references: [id], onDelete: SetNull)
+  gatewayJobId String?
+
+  topup       Topup?      @relation(fields: [topupId], references: [id], onDelete: SetNull)
+  topupId     String?
+
+  @@index([accountId, createdAt(sort: Desc)])
+  @@index([kind])
+}
+
+// -----------------------------------------------------------------------------
+// Gateway jobs (per-chat-completion, settled on JobClaimed)
+// -----------------------------------------------------------------------------
+
+model GatewayJob {
+  id                   String           @id @default(uuid())
+  createdAt            DateTime         @default(now())
+  updatedAt            DateTime         @updatedAt
+
+  // Routing
+  routingId            String           @unique  // local routing id (keccak of request hash etc.)
+  onChainJobId         String?          @unique  // bytes32 from JobEscrow.JobPosted
+  requestHash          String?                   // Swarm chunk ref of encrypted request
+  responseHash         String?                   // Swarm chunk ref of encrypted response
+
+  // Counterparties / model
+  provider             String                     // 0x address selected by the gateway
+  modelId              String
+
+  // Billing (xBZZ-denominated; markup baked in)
+  estimatedMaxXbzzWei  Decimal          @db.Decimal(78, 0)
+  actualXbzzWei        Decimal?         @db.Decimal(78, 0)
+
+  // Lifecycle
+  status               GatewayJobStatus @default(posted)
+  postedAt             DateTime         @default(now())
+  ackedAt              DateTime?
+  deliveredAt          DateTime?
+  claimedAt            DateTime?
+  ackDeadline          DateTime?
+  deliveryDeadline     DateTime?
+
+  // Token accounting (from JobClaimed actualPayment)
+  promptTokens         Int?
+  completionTokens     Int?
+
+  // Optional payload retention (off by default; T4T_PERSIST_PAYLOADS-style)
+  promptRedacted       String?
+  responseRedacted     String?
+  errorMessage         String?
+
+  user                 User             @relation(fields: [userId], references: [id], onDelete: Cascade)
+  userId               String
+
+  ledgerEntries        LedgerEntry[]
+
+  @@index([userId, createdAt(sort: Desc)])
+  @@index([status])
+  @@index([onChainJobId])
+}
+
+// -----------------------------------------------------------------------------
+// Stripe top-ups (Phase 2)
+// -----------------------------------------------------------------------------
+
+model Topup {
+  id                  String      @id @default(uuid())
+  createdAt           DateTime    @default(now())
+  updatedAt           DateTime    @updatedAt
+  status              TopupStatus @default(requires_payment)
+
+  stripePaymentIntent String      @unique
+  amountUsdCents      Int
+
+  creditedXbzzWei     Decimal?    @db.Decimal(78, 0)
+  usdPerXbzzAtCredit  Decimal?    @db.Decimal(18, 8)
+
+  error               String?
+
+  user   User   @relation(fields: [userId], references: [id], onDelete: Cascade)
+  userId String
+
+  ledgerEntries LedgerEntry[]
+
+  @@index([userId, createdAt(sort: Desc)])
+  @@index([status])
+}
