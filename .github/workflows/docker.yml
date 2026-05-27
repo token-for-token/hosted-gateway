@@ -55,5 +55,6 @@ jobs:
           key: ${{ secrets.SSH_PRIV_KEY }}
           script: |
             echo ${{ secrets.GITHUB_TOKEN }} | docker login ghcr.io -u ${{ github.actor }} --password-stdin
+            docker pull ghcr.io/token-for-token/hosted-gateway:main
             docker stack deploy -c ~/devops/hostinger/prod-stack.yaml prod --with-registry-auth --resolve-image always
             docker image prune -f --filter "until=24h"
