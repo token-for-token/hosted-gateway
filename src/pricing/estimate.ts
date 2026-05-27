@@ -4,6 +4,19 @@ import { env } from '../env';
 const BPS_DIVISOR = 10_000n;
 const TOKENS_PER_MILLION = 1_000_000n;
 
+// Conservative ceiling matches the t4t/container homelab gateway. We assume
+// prompt and completion could each be `max_tokens + headroom` and budget both
+// sides at the model's full split rate. The provider always claims the actual
+// (smaller) amount; the JobEscrow contract refunds the remainder to the client.
+//
+// Why so generous: providers may apply chat templates that inflate the prompt
+// token count well beyond the user-visible messages, and the on-chain
+// `maxContextTokens` is sometimes unset (== 0) — in which case the previous
+// per-actual-input formula posted a too-low maxPayment and the provider's
+// claimJob reverted with PaymentTooHigh.
+const DEFAULT_MAX_TOKENS = 1024n;
+const HEADROOM_TOKENS = 1_000_000n;
+
 export interface ChatRequest {
   model: string;
   max_tokens?: number;
@@ -23,24 +36,13 @@ export function estimateMaxXbzz(
   req: ChatRequest,
   offering: Pick<ModelOffering, 'inputPricePerMillionTokens' | 'outputPricePerMillionTokens' | 'maxContextTokens'>,
 ): { rawWei: bigint; withMarkupWei: bigint } {
-  const maxInputTokens = estimateInputTokens(req);
-  const maxOutputTokens = BigInt(req.max_tokens ?? Number(offering.maxContextTokens));
-
-  const inputCost = (BigInt(maxInputTokens) * BigInt(offering.inputPricePerMillionTokens)) / TOKENS_PER_MILLION;
-  const outputCost = (maxOutputTokens * BigInt(offering.outputPricePerMillionTokens)) / TOKENS_PER_MILLION;
-  const rawWei = inputCost + outputCost;
+  const maxTokens = BigInt(req.max_tokens ?? DEFAULT_MAX_TOKENS);
+  const budget = maxTokens + HEADROOM_TOKENS;
+  const inPay = BigInt(offering.inputPricePerMillionTokens) * budget;
+  const outPay = BigInt(offering.outputPricePerMillionTokens) * budget;
+  const rawWei = (inPay + outPay) / TOKENS_PER_MILLION;
   const withMarkupWei = (rawWei * (BPS_DIVISOR + BigInt(env.MARKUP_BPS))) / BPS_DIVISOR;
   return { rawWei, withMarkupWei };
-}
-
-/**
- * Approximate input-token count from messages. Uses a 4-char-per-token
- * heuristic — fine for an upper-bound estimate; the actual cost is recorded
- * later from the JobClaimed event.
- */
-function estimateInputTokens(req: ChatRequest): number {
-  const totalChars = (req.messages ?? []).reduce((acc, m) => acc + (m.content?.length ?? 0), 0);
-  return Math.ceil(totalChars / 4) + 16; // +16 for system / role overhead
 }
 
 /** Apply the same markup function used at reservation time to a settled cost. */
