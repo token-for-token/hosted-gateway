@@ -8,6 +8,7 @@ import { usersRoutes } from './users/routes';
 import { accountsRoutes } from './accounts/routes';
 import { apiKeysRoutes } from './apiKeys/routes';
 import { gatewayRoutes } from './gateway/routes';
+import { beeRoutes } from './bee/routes';
 import { getGatewayContext } from './gateway/context';
 
 const app = new Elysia()
@@ -25,6 +26,7 @@ const app = new Elysia()
   .use(usersRoutes)
   .use(accountsRoutes)
   .use(apiKeysRoutes)
+  .use(beeRoutes)
   .use(gatewayRoutes);
 
 // Start the HTTP server immediately so auth / accounts / api-keys routes are
