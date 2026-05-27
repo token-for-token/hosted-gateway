@@ -45,3 +45,15 @@ jobs:
             COMMIT_SHA=${{ github.sha }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
+
+      - name: docker stack deploy
+        if: github.event_name != 'pull_request'
+        uses: appleboy/ssh-action@v1.0.3
+        with:
+          username: root
+          host: ${{ secrets.SSH_KNOWN_HOSTS }}
+          key: ${{ secrets.SSH_PRIV_KEY }}
+          script: |
+            echo ${{ secrets.GITHUB_TOKEN }} | docker login ghcr.io -u ${{ github.actor }} --password-stdin
+            docker stack deploy -c ~/devops/hostinger/prod-stack.yaml prod --with-registry-auth --resolve-image always
+            docker image prune -f --filter "until=24h"
