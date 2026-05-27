@@ -12,7 +12,7 @@ import { getGatewayContext } from './gateway/context';
 
 const app = new Elysia()
   .use(cors())
-  .use(swagger())
+  .use(swagger({ path: '/' }))
   .onError(({ error, set }) => {
     const status = set.status ?? 500;
     const message = (error as Error).message ?? 'Internal error';
