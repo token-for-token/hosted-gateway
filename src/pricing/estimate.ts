@@ -15,7 +15,14 @@ const TOKENS_PER_MILLION = 1_000_000n;
 // per-actual-input formula posted a too-low maxPayment and the provider's
 // claimJob reverted with PaymentTooHigh.
 const DEFAULT_MAX_TOKENS = 1024n;
-const HEADROOM_TOKENS = 1_000_000n;
+// Headroom is added to BOTH input and output budgets to cover usage drift
+// (chat templates, system prompts the user can't see, etc.). The
+// concurrency cap on JobEscrow.postJob is
+//   needed = (openJobs + 1) * SLASH_MULT_TIMEOUT * maxPayment <= stake
+// so headroom directly multiplies how much stake the provider must lock per
+// in-flight job. 50k tokens is generous enough that real usage never exceeds
+// it but small enough that 20-ish concurrent jobs fit in a 70-xBZZ stake.
+const HEADROOM_TOKENS = 50_000n;
 
 export interface ChatRequest {
   model: string;
