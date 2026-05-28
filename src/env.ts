@@ -58,6 +58,12 @@ const EnvSchema = z.object({
   HOSTED_GATEWAY_PORT: z.coerce.number().int().positive().default(8080),
   LOG_LEVEL: z.enum(['fatal', 'error', 'warn', 'info', 'debug', 'trace']).default('info'),
 
+  // Operator PSS keypair file. All `prod_api` and `prod_worker` replicas
+  // share this key so providers can encrypt their PSS replies to a single
+  // identity. The compose mounts a named volume at /data so the key persists
+  // across deploys and is visible to every replica.
+  PSS_KEY_PATH: z.string().default('/data/pss.key'),
+
   // Phase 2 — Stripe (optional)
   STRIPE_SECRET_KEY: z.string().optional(),
   STRIPE_WEBHOOK_SECRET: z.string().optional(),

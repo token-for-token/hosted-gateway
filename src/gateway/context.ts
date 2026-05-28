@@ -14,7 +14,7 @@ import { discoverUsableBatchId, downloadChunk, PssTransport } from '../t4t/lib/s
 import { ensureManagedStamp, topUpIfBelow, type ManagedStamp } from '../t4t/lib/stamps';
 import { clientTopic } from '../t4t/lib/envelope';
 import { EciesCipher, jsonDecrypt } from '../t4t/lib/crypto';
-import { generatePssKeypair } from '../t4t/lib/keys';
+import { loadOrCreatePssKey } from '../t4t/lib/keys';
 import { ModelDiscovery } from '../t4t/modes/gateway/models';
 import type {
   JobAckBody,
@@ -89,12 +89,16 @@ async function bootGatewayContext(): Promise<GatewayContext> {
     xbzz: env.XBZZ_ADDRESS as Hex,
   });
 
-  // Operator PSS keypair — non-persistent for now; tenants reuse this single
-  // operator key (providers see all jobs as coming from the same client PSS
-  // identity, which matches the on-chain wallet model).
-  const pssKeys = generatePssKeypair();
+  // Operator PSS keypair — persisted to disk so every api replica shares the
+  // same identity. Without this, each replica generates a fresh keypair at
+  // boot and providers encrypt their PSS replies to a key only one replica
+  // can decrypt, so most chat completions hang.
+  const pssKeys = loadOrCreatePssKey(env.PSS_KEY_PATH);
 
   const cipher = new EciesCipher(pssKeys.privateKey);
+  // Block until Bee returns a non-zero overlay; without this, a replica that
+  // races Bee's boot persists `selfOverlay = 0x00…00` in its gateway context
+  // and providers send PSS replies into the void.
   const selfOverlay = await resolveSelfOverlay(bee);
   const pss = new PssTransport({ bee, postageBatchId, logger, selfAddress: chain.address });
 
@@ -297,9 +301,17 @@ async function resolvePostageBatch(bee: Bee): Promise<string> {
 }
 
 async function resolveSelfOverlay(bee: Bee): Promise<Hex> {
-  const info = await bee.getNodeAddresses().catch(() => null);
-  const overlay = info?.overlay?.toString() ?? '00'.repeat(32);
-  return ('0x' + overlay.replace(/^0x/, '')) as Hex;
+  const zero = '0x' + '00'.repeat(32);
+  for (let attempt = 0; attempt < 60; attempt++) {
+    const info = await bee.getNodeAddresses().catch(() => null);
+    const overlay = info?.overlay?.toString();
+    if (overlay && overlay.replace(/^0x/, '') !== '00'.repeat(32)) {
+      return ('0x' + overlay.replace(/^0x/, '')) as Hex;
+    }
+    logger.warn({ attempt }, 'bee.getNodeAddresses returned no overlay yet — retrying in 5s');
+    await new Promise((r) => setTimeout(r, 5000));
+  }
+  throw new Error('bee did not return a non-zero overlay after 60 attempts — refusing to boot with a zeroed selfOverlay');
 }
 
 /** Update a GatewayJob row. Direct prisma write (not model.gatewayJob.update)
