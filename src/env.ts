@@ -56,6 +56,10 @@ const EnvSchema = z.object({
 
   // Server
   HOSTED_GATEWAY_PORT: z.coerce.number().int().positive().default(8080),
+  // Public base URL of this gateway, advertised to providers in job_notify
+  // envelopes as `clientReplyUrl`. Providers POST ack/deliver here when PSS
+  // reverse delivery is unreliable (e.g. Bee 2.8 push-routing skips us).
+  PUBLIC_API_URL: z.string().url().optional(),
   LOG_LEVEL: z.enum(['fatal', 'error', 'warn', 'info', 'debug', 'trace']).default('info'),
 
   // Operator PSS keypair file. All `prod_api` and `prod_worker` replicas

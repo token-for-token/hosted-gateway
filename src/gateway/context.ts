@@ -17,6 +17,7 @@ import { EciesCipher, jsonDecrypt } from '../t4t/lib/crypto';
 import { loadOrCreatePssKey } from '../t4t/lib/keys';
 import { ModelDiscovery } from '../t4t/modes/gateway/models';
 import type {
+  Envelope,
   JobAckBody,
   JobDeliverBody,
   OpenAIChatResponse,
@@ -66,6 +67,11 @@ export interface GatewayContext {
   clearFailureTimers: (routing: Hex) => void;
   rejectAndCleanup: (routing: Hex, err: Error) => void;
   scheduleAckTimeout: (routing: Hex, slot: FailureSlot) => void;
+  /** Process an inbound signed envelope from any transport (PSS or HTTPS).
+   *  The caller is responsible for verifyEnvelope; the PSS subscription
+   *  layer already does this. The HTTPS inbox endpoint must do it before
+   *  invoking. */
+  onEnvelope: (envelope: Envelope) => Promise<void>;
 }
 
 let bootPromise: Promise<GatewayContext> | null = null;
@@ -176,62 +182,66 @@ async function bootGatewayContext(): Promise<GatewayContext> {
     }, (ACK_WINDOW_SECONDS + FAILURE_GRACE_SECONDS) * 1000);
   }
 
+  // Handler for any verified envelope addressed to this gateway, regardless
+  // of which transport (PSS subscription or HTTPS /pss/inbox) brought it.
+  const onEnvelope = async (envelope: Envelope): Promise<void> => {
+    if (envelope.type === 'job_ack') {
+      const body = envelope.body as JobAckBody;
+      logger.info({ jobId: body.jobId, eta: body.estimatedCompletion }, 'ack received');
+      const slot = failureTimers.get(body.jobId);
+      const meta = jobMeta.get(body.jobId);
+      if (slot) {
+        if (slot.cancelTimer) {
+          clearTimeout(slot.cancelTimer);
+          slot.cancelTimer = undefined;
+        }
+        if (!slot.timeoutTimer) {
+          const msUntilTimeout = Math.max(
+            0,
+            (slot.deliveryDeadline + FAILURE_GRACE_SECONDS) * 1000 - Date.now(),
+          );
+          slot.timeoutTimer = setTimeout(() => {
+            onDeliveryTimeout(body.jobId).catch((err) =>
+              logger.error({ err, routing: body.jobId }, 'onDeliveryTimeout threw'),
+            );
+          }, msUntilTimeout);
+        }
+      }
+      if (meta) {
+        await markGatewayJob(meta.gatewayJobId, 'acked', null, { ackedAt: new Date() });
+      }
+    } else if (envelope.type === 'job_deliver') {
+      const body = envelope.body as JobDeliverBody;
+      const slot = pending.get(body.jobId);
+      const meta = jobMeta.get(body.jobId);
+      if (!slot) return;
+      try {
+        const bytes = await downloadChunk({ bee, postageBatchId, logger }, body.responseHash);
+        const payload = await jsonDecrypt<ResponsePayload>(cipher, bytes);
+        if (meta) {
+          await markGatewayJob(meta.gatewayJobId, 'delivered', null, {
+            deliveredAt: new Date(),
+            responseHash: body.responseHash,
+            promptTokens: payload.openaiResponse.usage?.prompt_tokens ?? null,
+            completionTokens: payload.openaiResponse.usage?.completion_tokens ?? null,
+          });
+        }
+        slot.resolve(payload.openaiResponse);
+      } catch (err) {
+        slot.reject(err);
+      } finally {
+        pending.delete(body.jobId);
+        jobMeta.delete(body.jobId);
+        clearFailureTimers(body.jobId);
+      }
+    }
+  };
+
   // Subscribe to the operator's client topic — ALL tenants' jobs come back
   // here (because all jobs go on-chain as the operator wallet).
   pss.subscribe({
     topic: clientTopic(chain.address),
-    onEnvelope: async (envelope) => {
-      if (envelope.type === 'job_ack') {
-        const body = envelope.body as JobAckBody;
-        logger.info({ jobId: body.jobId, eta: body.estimatedCompletion }, 'ack received');
-        const slot = failureTimers.get(body.jobId);
-        const meta = jobMeta.get(body.jobId);
-        if (slot) {
-          if (slot.cancelTimer) {
-            clearTimeout(slot.cancelTimer);
-            slot.cancelTimer = undefined;
-          }
-          if (!slot.timeoutTimer) {
-            const msUntilTimeout = Math.max(
-              0,
-              (slot.deliveryDeadline + FAILURE_GRACE_SECONDS) * 1000 - Date.now(),
-            );
-            slot.timeoutTimer = setTimeout(() => {
-              onDeliveryTimeout(body.jobId).catch((err) =>
-                logger.error({ err, routing: body.jobId }, 'onDeliveryTimeout threw'),
-              );
-            }, msUntilTimeout);
-          }
-        }
-        if (meta) {
-          await markGatewayJob(meta.gatewayJobId, 'acked', null, { ackedAt: new Date() });
-        }
-      } else if (envelope.type === 'job_deliver') {
-        const body = envelope.body as JobDeliverBody;
-        const slot = pending.get(body.jobId);
-        const meta = jobMeta.get(body.jobId);
-        if (!slot) return;
-        try {
-          const bytes = await downloadChunk({ bee, postageBatchId, logger }, body.responseHash);
-          const payload = await jsonDecrypt<ResponsePayload>(cipher, bytes);
-          if (meta) {
-            await markGatewayJob(meta.gatewayJobId, 'delivered', null, {
-              deliveredAt: new Date(),
-              responseHash: body.responseHash,
-              promptTokens: payload.openaiResponse.usage?.prompt_tokens ?? null,
-              completionTokens: payload.openaiResponse.usage?.completion_tokens ?? null,
-            });
-          }
-          slot.resolve(payload.openaiResponse);
-        } catch (err) {
-          slot.reject(err);
-        } finally {
-          pending.delete(body.jobId);
-          jobMeta.delete(body.jobId);
-          clearFailureTimers(body.jobId);
-        }
-      }
-    },
+    onEnvelope,
   });
 
   logger.info(
@@ -259,6 +269,7 @@ async function bootGatewayContext(): Promise<GatewayContext> {
     clearFailureTimers,
     rejectAndCleanup,
     scheduleAckTimeout,
+    onEnvelope,
   };
 }
 

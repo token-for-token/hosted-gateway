@@ -138,6 +138,7 @@ export async function handleChat(args: HandleChatArgs): Promise<HandleChatResult
           deliveryDeadline,
           clientPssPubKey: ctx.pssPubKeyX,
           clientSwarmOverlay: ctx.selfOverlay,
+          clientReplyUrl: env.PUBLIC_API_URL ? `${env.PUBLIC_API_URL.replace(/\/$/, '')}/pss/inbox` : undefined,
         },
       },
       (msg) => ctx.chain.wallet.signMessage({ account: ctx.chain.wallet.account!, message: msg }),
