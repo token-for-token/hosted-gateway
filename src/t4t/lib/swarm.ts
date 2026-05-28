@@ -149,30 +149,50 @@ export class PssTransport {
 
   subscribe(args: PssSubscribeArgs): PssSubscription {
     const topic = Topic.fromString(args.topic)
-    return this.opts.bee.pssSubscribe(topic, {
-      onMessage: async msg => {
-        try {
-          const env = decodeEnvelope(msg.toUtf8())
-          const key = envelopeKey(env)
-          if (this.dedup.has(key)) return
-          if (!(await verifyEnvelope(env))) {
-            this.opts.logger.warn({from: env.from}, 'envelope signature verification failed')
-            return
+    // Bee's pssSubscribe is a WebSocket that Bee closes whenever it feels like
+    // (idle timeout, broker hiccup, transient WS reset). Without re-subscribe,
+    // the gateway misses every envelope after the first close — which silently
+    // breaks every job whose provider sends ack/deliver more than a few
+    // seconds after the chat request lands. Wrap the subscription in a
+    // self-healing loop: on close, log + reopen.
+    let cancelled = false
+    let current: PssSubscription | null = null
+    const RECONNECT_DELAY_MS = 500
+    const open = (): void => {
+      if (cancelled) return
+      current = this.opts.bee.pssSubscribe(topic, {
+        onMessage: async msg => {
+          try {
+            const env = decodeEnvelope(msg.toUtf8())
+            const key = envelopeKey(env)
+            if (this.dedup.has(key)) return
+            if (!(await verifyEnvelope(env))) {
+              this.opts.logger.warn({from: env.from}, 'envelope signature verification failed')
+              return
+            }
+            this.dedup.mark(key)
+            await args.onEnvelope(env)
+          } catch (err) {
+            args.onError?.(err)
+            this.opts.logger.error({err}, 'pss decode failure')
           }
-          this.dedup.mark(key)
-          await args.onEnvelope(env)
-        } catch (err) {
+        },
+        onError: err => {
           args.onError?.(err)
-          this.opts.logger.error({err}, 'pss decode failure')
-        }
+          this.opts.logger.error({err}, 'pss subscription error')
+        },
+        onClose: () => {
+          this.opts.logger.warn({topic: args.topic}, 'pss subscription closed — reopening')
+          if (!cancelled) setTimeout(open, RECONNECT_DELAY_MS)
+        },
+      })
+    }
+    open()
+    return {
+      cancel: () => {
+        cancelled = true
+        current?.cancel()
       },
-      onError: err => {
-        args.onError?.(err)
-        this.opts.logger.error({err}, 'pss subscription error')
-      },
-      onClose: () => {
-        this.opts.logger.warn({topic: args.topic}, 'pss subscription closed')
-      },
-    })
+    } as PssSubscription
   }
 }
