@@ -18,6 +18,41 @@ function isBatchOverissued(err: unknown): boolean {
   return /overissued|insufficient/i.test(msg) || e.responseBody?.code === 402
 }
 
+/** Detect HTTP 429 from Bee. bee-js surfaces this as either an axios-style
+ *  message ("Request failed with status code 429") or as `{status: 429}`. */
+function isRateLimited(err: unknown): boolean {
+  const e = err as {status?: number; message?: string} | null
+  if (!e) return false
+  if (e.status === 429) return true
+  return typeof e.message === 'string' && /status code 429|\b429\b/.test(e.message)
+}
+
+/** Retry a Bee call that 429-ed with exponential backoff. Bee rate-limits
+ *  concurrent uploads to the same postage batch (and PSS sends) to serialize
+ *  bucket writes — with multiple gateway replicas + the worker hitting one
+ *  batch, that surfaces as user-visible failures unless we back off and retry.
+ *  Non-429 errors propagate immediately. */
+async function withRateLimitRetry<T>(
+  logger: Logger,
+  label: string,
+  fn: () => Promise<T>,
+  delaysMs: readonly number[] = [500, 1500, 4000, 9000],
+): Promise<T> {
+  let lastErr: unknown
+  for (let i = 0; i <= delaysMs.length; i++) {
+    try {
+      return await fn()
+    } catch (err) {
+      lastErr = err
+      if (!isRateLimited(err) || i === delaysMs.length) throw err
+      const delay = delaysMs[i]!
+      logger.warn({label, attempt: i + 1, delay}, 'bee 429 — backing off and retrying')
+      await new Promise(r => setTimeout(r, delay))
+    }
+  }
+  throw lastErr
+}
+
 /** Emergency self-heal: when a Bee call fails because the batch is full,
  *  dilute it by +1 depth (doubles bucket capacity, halves remaining TTL) and
  *  retry the call exactly once. Logged so the operator sees the recovery.
@@ -65,10 +100,12 @@ export async function uploadChunk(
   opts: SwarmClientOpts,
   bytes: Uint8Array,
 ): Promise<string> {
-  return withBatchRecovery(opts, async () => {
-    const {reference} = await opts.bee.uploadData(opts.postageBatchId, bytes)
-    return reference.toString()
-  })
+  return withRateLimitRetry(opts.logger, 'uploadChunk', () =>
+    withBatchRecovery(opts, async () => {
+      const {reference} = await opts.bee.uploadData(opts.postageBatchId, bytes)
+      return reference.toString()
+    }),
+  )
 }
 
 export async function downloadChunk(opts: SwarmClientOpts, reference: string): Promise<Uint8Array> {
