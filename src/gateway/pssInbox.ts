@@ -11,9 +11,11 @@ import { logger } from '../logger';
  * hand off to the shared envelope handler.
  *
  * Lives outside the JWT-guarded routes because providers don't have JWTs.
- * Security model: anyone can POST, but only envelopes signed by a wallet the
- * gateway is actively waiting on (`pending.has(jobId)`) ever produce side
- * effects. Unsigned or unmatched envelopes are dropped.
+ * Security model: anyone can POST, but an envelope only produces side effects
+ * if (a) its signature recovers to `envelope.from`, checked here, and (b)
+ * `envelope.from` is the provider the gateway posted that job to, checked in
+ * `onEnvelope`. Everything else is dropped. The signature check alone is not
+ * enough — it authenticates the sender, it does not authorize them.
  */
 export const pssInboxRoutes = new Elysia().post(
   '/pss/inbox',

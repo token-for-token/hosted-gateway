@@ -13,6 +13,7 @@
     "db:migrate": "bunx prisma migrate deploy",
     "db:seed": "bun run prisma/seed/index.ts",
     "test:e2e": "bun test --preload ./test/setup.ts ./test/**/*.e2e-spec.ts",
+    "test:unit": "bun test ./test/unit",
     "typecheck": "bunx tsc --noEmit"
   },
   "//comment": "Prisma 7 reads its config from prisma.config.ts at the package root, not from package.json#prisma.",

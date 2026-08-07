@@ -13,6 +13,12 @@ import { logger } from '../logger';
  * account), not as ledger rows — the ledger means "money moved" not "money
  * locked". On `JobClaimed` the reservation is released AND a `settle` ledger
  * row debits the actual cost.
+ *
+ * A reservation must be released exactly once, and the race is real: the
+ * failure timers, `handleChat`'s catch block and the claim watcher can all
+ * reach the same job. `GatewayJob.reservationReleasedAt` is the compare-and-set
+ * marker — whichever transaction flips it from NULL owns the decrement, and
+ * everyone else no-ops.
  */
 
 export class InsufficientBalanceError extends Error {
@@ -79,8 +85,31 @@ export async function reserveXbzz(userId: string, amountWei: bigint): Promise<vo
 }
 
 /**
+ * Claim the right to release a job's reservation. Returns true for the caller
+ * that flipped `reservationReleasedAt` from NULL, false for everyone after it
+ * (including a job row that no longer exists).
+ *
+ * Concurrent callers serialize on the row lock `updateMany` takes; under READ
+ * COMMITTED the loser re-evaluates the `reservationReleasedAt: null` predicate
+ * against the committed row and matches nothing.
+ */
+async function claimReservationRelease(
+  tx: Prisma.TransactionClient,
+  gatewayJobId: string,
+): Promise<boolean> {
+  const { count } = await tx.gatewayJob.updateMany({
+    where: { id: gatewayJobId, reservationReleasedAt: null },
+    data: { reservationReleasedAt: new Date() },
+  });
+  return count > 0;
+}
+
+/**
  * Settle a completed job: release the reservation and debit the actual cost.
- * Idempotent via the `settle:<gatewayJobId>` ledger key.
+ * The balance debit is idempotent via the `settle:<gatewayJobId>` ledger key;
+ * the reservation release is idempotent via `reservationReleasedAt`, which also
+ * covers the case where a failure path already released it (job cancelled
+ * locally but claimed on-chain anyway).
  */
 export async function settleXbzz(
   userId: string,
@@ -100,11 +129,14 @@ export async function settleXbzz(
           idempotencyKey: key,
         },
       });
+      const releasing = await claimReservationRelease(tx, gatewayJobId);
       await tx.account.update({
         where: { userId },
         data: {
           balanceXbzzWei: { decrement: new Prisma.Decimal(actualXbzzWei.toString()) },
-          reservedXbzzWei: { decrement: new Prisma.Decimal(estimateXbzzWei.toString()) },
+          ...(releasing
+            ? { reservedXbzzWei: { decrement: new Prisma.Decimal(estimateXbzzWei.toString()) } }
+            : {}),
         },
       });
     });
@@ -118,10 +150,10 @@ export async function settleXbzz(
 }
 
 /**
- * Release a reservation without debiting (job cancelled or timed out).
- * Idempotent via `release:<gatewayJobId>` — but we don't write a ledger row,
- * we only adjust `reservedXbzzWei` and rely on the GatewayJob status
- * transition to mark the release as having happened.
+ * Release a reservation without debiting (job cancelled, timed out, or never
+ * dispatched). No ledger row — no money moved, only the lock lifted. Safe to
+ * call from every failure path and in any order relative to the GatewayJob
+ * status transition: `reservationReleasedAt` decides who actually decrements.
  */
 export async function releaseReservation(
   userId: string,
@@ -129,14 +161,7 @@ export async function releaseReservation(
   estimateXbzzWei: bigint,
 ): Promise<void> {
   await prisma.$transaction(async (tx) => {
-    const job = await tx.gatewayJob.findUniqueOrThrow({
-      where: { id: gatewayJobId },
-      select: { status: true },
-    });
-    // Only release once — `cancelled` / `timed_out` / `failed` are terminal.
-    if (job.status === 'cancelled' || job.status === 'timed_out' || job.status === 'failed') {
-      return;
-    }
+    if (!(await claimReservationRelease(tx, gatewayJobId))) return;
     await tx.account.update({
       where: { userId },
       data: { reservedXbzzWei: { decrement: new Prisma.Decimal(estimateXbzzWei.toString()) } },

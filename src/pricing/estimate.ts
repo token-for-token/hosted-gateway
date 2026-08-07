@@ -43,7 +43,15 @@ export function estimateMaxXbzz(
   req: ChatRequest,
   offering: Pick<ModelOffering, 'inputPricePerMillionTokens' | 'outputPricePerMillionTokens' | 'maxContextTokens'>,
 ): { rawWei: bigint; withMarkupWei: bigint } {
-  const maxTokens = BigInt(req.max_tokens ?? DEFAULT_MAX_TOKENS);
+  // `max_tokens` reaches us straight off the wire. A fractional value makes
+  // `BigInt()` throw and a negative one budgets a negative reservation (which
+  // would *credit* the caller), so anything that isn't a positive integer falls
+  // back to the default.
+  const requested = req.max_tokens;
+  const maxTokens =
+    typeof requested === 'number' && Number.isInteger(requested) && requested > 0
+      ? BigInt(requested)
+      : DEFAULT_MAX_TOKENS;
   const budget = maxTokens + HEADROOM_TOKENS;
   const inPay = BigInt(offering.inputPricePerMillionTokens) * budget;
   const outPay = BigInt(offering.outputPricePerMillionTokens) * budget;

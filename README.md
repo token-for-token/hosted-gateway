@@ -40,6 +40,7 @@ src/
   env.ts               # zod-validated process.env
   auth/                # JWT, Google OAuth, email signup
   users/, accounts/, apiKeys/, pricing/, gateway/, chain/
+  lib/                 # shared coercion helpers (Decimal → wei string, query params)
   queue/               # connection, registry, lock, processor base, service
   t4t/                 # VENDORED from t4t-container
 prisma/schema.prisma

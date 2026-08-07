@@ -7,6 +7,8 @@ import { Semaphore } from '../queue/semaphore';
 import { env } from '../env';
 import { logger } from '../logger';
 import { InsufficientBalanceError } from '../accounts/ledger';
+import { weiString } from '../lib/decimal';
+import { parseLimit } from '../lib/query';
 
 const semaphore = new Semaphore(env.MAX_CONCURRENT_JOBS);
 
@@ -73,7 +75,10 @@ export const gatewayRoutes = new Elysia()
             }),
           ),
           temperature: t.Optional(t.Number()),
-          max_tokens: t.Optional(t.Number()),
+          // Integer-and-positive is enforced here rather than in the pricing
+          // math: a fractional `max_tokens` makes `BigInt()` throw (500), and a
+          // negative one budgets a negative reservation.
+          max_tokens: t.Optional(t.Integer({ minimum: 1 })),
           stream: t.Optional(t.Boolean()),
         },
         { additionalProperties: true },
@@ -81,7 +86,7 @@ export const gatewayRoutes = new Elysia()
     },
   )
   .get('/v1/jobs', async ({ user, query }) => {
-    const limit = Math.min(Number(query.limit ?? 50), 200);
+    const limit = parseLimit(query.limit);
     const jobs = await prisma.gatewayJob.findMany({
       where: { userId: user.userId },
       orderBy: { createdAt: 'desc' },
@@ -104,7 +109,7 @@ export const gatewayRoutes = new Elysia()
     });
     return jobs.map((j) => ({
       ...j,
-      estimatedMaxXbzzWei: j.estimatedMaxXbzzWei.toString(),
-      actualXbzzWei: j.actualXbzzWei?.toString() ?? null,
+      estimatedMaxXbzzWei: weiString(j.estimatedMaxXbzzWei),
+      actualXbzzWei: j.actualXbzzWei ? weiString(j.actualXbzzWei) : null,
     }));
   });

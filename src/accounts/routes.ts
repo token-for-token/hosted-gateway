@@ -2,6 +2,8 @@ import Elysia from 'elysia';
 import { prisma } from '../db';
 import { jwtGuard } from '../auth/jwt';
 import { getUsdEquivalent } from '../pricing/usdDisplay';
+import { weiString, weiToBigInt } from '../lib/decimal';
+import { parseLimit } from '../lib/query';
 
 export const accountsRoutes = new Elysia({ prefix: '/accounts' })
   .use(jwtGuard)
@@ -18,8 +20,8 @@ export const accountsRoutes = new Elysia({ prefix: '/accounts' })
       },
     });
 
-    const balanceWei = BigInt(account.balanceXbzzWei.toString());
-    const reservedWei = BigInt(account.reservedXbzzWei.toString());
+    const balanceWei = weiToBigInt(account.balanceXbzzWei);
+    const reservedWei = weiToBigInt(account.reservedXbzzWei);
     const available = balanceWei - reservedWei;
 
     const balanceUsd = await getUsdEquivalent(balanceWei).catch(() => null);
@@ -28,8 +30,8 @@ export const accountsRoutes = new Elysia({ prefix: '/accounts' })
     return {
       id: account.id,
       status: account.status,
-      balanceXbzzWei: account.balanceXbzzWei.toString(),
-      reservedXbzzWei: account.reservedXbzzWei.toString(),
+      balanceXbzzWei: weiString(account.balanceXbzzWei),
+      reservedXbzzWei: weiString(account.reservedXbzzWei),
       availableXbzzWei: available.toString(),
       balanceUsd,        // cosmetic; null if oracle unavailable
       availableUsd,
@@ -38,7 +40,7 @@ export const accountsRoutes = new Elysia({ prefix: '/accounts' })
     };
   })
   .get('/me/ledger', async ({ user, query }) => {
-    const limit = Math.min(Number(query.limit ?? 50), 200);
+    const limit = parseLimit(query.limit);
     const account = await prisma.account.findUniqueOrThrow({
       where: { userId: user.userId },
       select: { id: true },
@@ -57,5 +59,5 @@ export const accountsRoutes = new Elysia({ prefix: '/accounts' })
         note: true,
       },
     });
-    return entries.map((e) => ({ ...e, deltaXbzzWei: e.deltaXbzzWei.toString() }));
+    return entries.map((e) => ({ ...e, deltaXbzzWei: weiString(e.deltaXbzzWei) }));
   });

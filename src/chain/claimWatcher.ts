@@ -15,6 +15,7 @@ import { redisConnection } from '../queue/connection';
 import { logger } from '../logger';
 import { prisma } from '../db';
 import { settleXbzz } from '../accounts/ledger';
+import { weiToBigInt } from '../lib/decimal';
 import { applyMarkup } from '../pricing/estimate';
 import { getGatewayContext } from '../gateway/context';
 
@@ -88,7 +89,7 @@ async function handleClaimed(jobId: Hex | undefined, paid: bigint | undefined): 
   }
   if (job.status === 'claimed') return; // idempotent
 
-  const estimateWithMarkup = BigInt(job.estimatedMaxXbzzWei.toString());
+  const estimateWithMarkup = weiToBigInt(job.estimatedMaxXbzzWei);
   const actualWithMarkup = applyMarkup(paid);
 
   await settleXbzz(job.userId, job.id, estimateWithMarkup, actualWithMarkup);

@@ -176,6 +176,13 @@ model GatewayJob {
   ackDeadline          DateTime?
   deliveryDeadline     DateTime?
 
+  // Set the first time this job's off-chain reservation is released — by
+  // `settleXbzz` on JobClaimed, or by `releaseReservation` on cancel / timeout
+  // / dispatch failure. It is the compare-and-set marker that makes the
+  // release exactly-once: `status` cannot serve that role because a job can be
+  // marked terminal and released by different code paths in either order.
+  reservationReleasedAt DateTime?
+
   // Token accounting (from JobClaimed actualPayment)
   promptTokens         Int?
   completionTokens     Int?

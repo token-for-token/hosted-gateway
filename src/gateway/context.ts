@@ -133,19 +133,41 @@ async function bootGatewayContext(): Promise<GatewayContext> {
     clearFailureTimers(routing);
   }
 
+  /** Lift the tenant's reservation, then record the terminal status. The order
+   *  no longer matters for correctness (`reservationReleasedAt` is the
+   *  exactly-once marker, not the job status), but a failure to release must
+   *  never stop us from settling the request — otherwise the caller hangs. */
+  async function releaseAndMark(
+    routing: Hex,
+    meta: JobMetaSlot,
+    status: 'cancelled' | 'timed_out' | 'failed',
+    reason: string,
+  ): Promise<void> {
+    await releaseReservation(meta.userId, meta.gatewayJobId, meta.estimateMaxXbzzWei).catch((err) =>
+      logger.error({ err, routing, gatewayJobId: meta.gatewayJobId }, 'reservation release failed'),
+    );
+    await markGatewayJob(meta.gatewayJobId, status, reason);
+  }
+
   async function onAckTimeout(routing: Hex): Promise<void> {
     const slot = failureTimers.get(routing);
     const meta = jobMeta.get(routing);
     if (!slot || !meta) return;
+    slot.cancelTimer = undefined;
     try {
       const tx = await cancelJob(chain, slot.onChainJobId);
       logger.warn({ tx, routing, onChainJobId: slot.onChainJobId }, 'no ACK — cancelled on-chain');
-      await markGatewayJob(meta.gatewayJobId, 'cancelled', 'no PSS ack within ACK_WINDOW');
-      await releaseReservation(meta.userId, meta.gatewayJobId, meta.estimateMaxXbzzWei);
-      rejectAndCleanup(routing, new Error('provider failed to ACK within window'));
     } catch (err) {
-      logger.warn({ err, routing }, 'cancelJob failed — provider likely acked mid-flight');
+      // Most likely the provider acked mid-flight, so the job is still live and
+      // cancelling it is no longer allowed. We are done waiting on the ACK
+      // either way — hand the job to the delivery deadline so *something* still
+      // settles it.
+      logger.warn({ err, routing }, 'cancelJob failed — falling through to the delivery deadline');
+      armDeliveryTimeout(routing, slot);
+      return;
     }
+    await releaseAndMark(routing, meta, 'cancelled', 'no PSS ack within ACK_WINDOW');
+    rejectAndCleanup(routing, new Error('provider failed to ACK within window'));
   }
 
   async function onDeliveryTimeout(routing: Hex): Promise<void> {
@@ -155,8 +177,7 @@ async function bootGatewayContext(): Promise<GatewayContext> {
     try {
       const tx = await timeoutJob(chain, slot.onChainJobId);
       logger.warn({ tx, routing, onChainJobId: slot.onChainJobId }, 'delivery missed — timeoutJob');
-      await markGatewayJob(meta.gatewayJobId, 'timed_out', 'no PSS delivery before deadline');
-      await releaseReservation(meta.userId, meta.gatewayJobId, meta.estimateMaxXbzzWei);
+      await releaseAndMark(routing, meta, 'timed_out', 'no PSS delivery before deadline');
       rejectAndCleanup(routing, new Error('provider failed to deliver before deadline'));
       return;
     } catch (err) {
@@ -165,11 +186,14 @@ async function bootGatewayContext(): Promise<GatewayContext> {
     try {
       const tx = await cancelJob(chain, slot.onChainJobId);
       logger.warn({ tx, routing, onChainJobId: slot.onChainJobId }, 'cancelJob fallback applied');
-      await markGatewayJob(meta.gatewayJobId, 'cancelled', 'no PSS delivery; cancelJob fallback');
-      await releaseReservation(meta.userId, meta.gatewayJobId, meta.estimateMaxXbzzWei);
+      await releaseAndMark(routing, meta, 'cancelled', 'no PSS delivery; cancelJob fallback');
       rejectAndCleanup(routing, new Error('provider failed to deliver before deadline'));
     } catch (err) {
       logger.error({ err, routing }, 'both timeoutJob and cancelJob failed — job stuck in escrow');
+      // The escrow entry is stuck, but the tenant shouldn't be: release the
+      // reservation. If the provider does eventually claim, `settleXbzz` still
+      // debits the actual cost and skips the (already taken) release.
+      await releaseAndMark(routing, meta, 'failed', 'delivery deadline missed; settlement failed');
       rejectAndCleanup(routing, new Error('delivery deadline missed; settlement failed'));
     }
   }
@@ -182,50 +206,83 @@ async function bootGatewayContext(): Promise<GatewayContext> {
     }, (ACK_WINDOW_SECONDS + FAILURE_GRACE_SECONDS) * 1000);
   }
 
+  /** Arm the delivery-deadline timer once. Every path that stops waiting for
+   *  an ACK must call this, otherwise nothing is left to settle the job and the
+   *  chat request hangs until the client gives up — holding a semaphore slot
+   *  and the tenant's reservation for as long as the process lives. */
+  function armDeliveryTimeout(routing: Hex, slot: FailureSlot): void {
+    if (slot.timeoutTimer) return;
+    const msUntilTimeout = Math.max(
+      0,
+      (slot.deliveryDeadline + FAILURE_GRACE_SECONDS) * 1000 - Date.now(),
+    );
+    slot.timeoutTimer = setTimeout(() => {
+      onDeliveryTimeout(routing).catch((err) =>
+        logger.error({ err, routing }, 'onDeliveryTimeout threw'),
+      );
+    }, msUntilTimeout);
+  }
+
+  /**
+   * An envelope only counts if it was signed by the provider this gateway
+   * actually posted the job to. `verifyEnvelope` proves the signature matches
+   * `envelope.from` — it says nothing about who `from` is, and the routing id
+   * plus our PSS public key both travel in the (unencrypted) `job_notify` body.
+   * Without this check anyone who observes a routing id can sign their own
+   * `job_deliver` and hand the tenant an arbitrary completion.
+   */
+  function envelopeSenderMatches(
+    envelope: Envelope,
+    meta: JobMetaSlot | undefined,
+  ): meta is JobMetaSlot {
+    if (!meta) return false;
+    return String(envelope.from).toLowerCase() === meta.provider.toLowerCase();
+  }
+
   // Handler for any verified envelope addressed to this gateway, regardless
   // of which transport (PSS subscription or HTTPS /pss/inbox) brought it.
   const onEnvelope = async (envelope: Envelope): Promise<void> => {
     if (envelope.type === 'job_ack') {
       const body = envelope.body as JobAckBody;
-      logger.info({ jobId: body.jobId, eta: body.estimatedCompletion }, 'ack received');
       const slot = failureTimers.get(body.jobId);
       const meta = jobMeta.get(body.jobId);
+      if (!envelopeSenderMatches(envelope, meta)) {
+        logger.warn(
+          { jobId: body.jobId, from: envelope.from, type: envelope.type },
+          'dropping envelope — not from the provider this job was posted to',
+        );
+        return;
+      }
+      logger.info({ jobId: body.jobId, eta: body.estimatedCompletion }, 'ack received');
       if (slot) {
         if (slot.cancelTimer) {
           clearTimeout(slot.cancelTimer);
           slot.cancelTimer = undefined;
         }
-        if (!slot.timeoutTimer) {
-          const msUntilTimeout = Math.max(
-            0,
-            (slot.deliveryDeadline + FAILURE_GRACE_SECONDS) * 1000 - Date.now(),
-          );
-          slot.timeoutTimer = setTimeout(() => {
-            onDeliveryTimeout(body.jobId).catch((err) =>
-              logger.error({ err, routing: body.jobId }, 'onDeliveryTimeout threw'),
-            );
-          }, msUntilTimeout);
-        }
+        armDeliveryTimeout(body.jobId, slot);
       }
-      if (meta) {
-        await markGatewayJob(meta.gatewayJobId, 'acked', null, { ackedAt: new Date() });
-      }
+      await markGatewayJob(meta.gatewayJobId, 'acked', null, { ackedAt: new Date() });
     } else if (envelope.type === 'job_deliver') {
       const body = envelope.body as JobDeliverBody;
       const slot = pending.get(body.jobId);
       const meta = jobMeta.get(body.jobId);
       if (!slot) return;
+      if (!envelopeSenderMatches(envelope, meta)) {
+        logger.warn(
+          { jobId: body.jobId, from: envelope.from, type: envelope.type },
+          'dropping envelope — not from the provider this job was posted to',
+        );
+        return;
+      }
       try {
         const bytes = await downloadChunk({ bee, postageBatchId, logger }, body.responseHash);
         const payload = await jsonDecrypt<ResponsePayload>(cipher, bytes);
-        if (meta) {
-          await markGatewayJob(meta.gatewayJobId, 'delivered', null, {
-            deliveredAt: new Date(),
-            responseHash: body.responseHash,
-            promptTokens: payload.openaiResponse.usage?.prompt_tokens ?? null,
-            completionTokens: payload.openaiResponse.usage?.completion_tokens ?? null,
-          });
-        }
+        await markGatewayJob(meta.gatewayJobId, 'delivered', null, {
+          deliveredAt: new Date(),
+          responseHash: body.responseHash,
+          promptTokens: payload.openaiResponse.usage?.prompt_tokens ?? null,
+          completionTokens: payload.openaiResponse.usage?.completion_tokens ?? null,
+        });
         slot.resolve(payload.openaiResponse);
       } catch (err) {
         slot.reject(err);

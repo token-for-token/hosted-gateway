@@ -50,9 +50,13 @@ export function createCudService<T>(
     },
 
     async delete(args: { where: any }): Promise<T> {
+      // Snapshot before the delete (the row is gone afterwards), but enqueue
+      // only once it has actually happened — otherwise a delete that throws
+      // still tells every consumer the entity is gone.
       const entity = await prismaDelegate.findUnique({ where: args.where });
-      await queue.add('deleted', { [queueName]: serializeBigInts(entity) });
-      return prismaDelegate.delete(args);
+      const deleted = await prismaDelegate.delete(args);
+      await queue.add('deleted', { [queueName]: serializeBigInts(entity ?? deleted) });
+      return deleted;
     },
   };
 }
